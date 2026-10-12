@@ -24,7 +24,7 @@
 ## 界面预览 (UI Preview)
 
 ```text
-⚡ Mihomo CLI v1.0.0  ● 运行中 (Mihomo v1.19.14)     RULE 规则模式 
+⚡ Mihomo CLI v1.0.1  ● 运行中 (Mihomo v1.19.14)     RULE 规则模式
   接口: http://127.0.0.1:9090  端口: 7890  连接数: 5  流量: ↑ 12.4 MB  ↓ 156.8 MB
   策略组: [🚀 节点选择]  当前在用节点: 🇯🇵 日本 01
   排序: ⚡ 延迟升序  (共 28 个节点)
@@ -182,6 +182,7 @@ eval $(mihomo-cli env off)  # 取消终端代理
 | `-s`, `--secret` | `MIHOMO_SECRET` | *(空)* | 控制器鉴权密钥 (Secret) |
 | `-g`, `--group` | `MIHOMO_GROUP` | *(自动检测)* | 目标操作的策略组名称 |
 | `--timeout` | `MIHOMO_TIMEOUT` | `2500` | 测速超时时间（毫秒） |
+| `--test-url` | `MIHOMO_TEST_URL` | `http://cp.cloudflare.com/generate_204` | HTTP/HTTPS 测速目标 |
 
 #### 自定义配置使用示例：
 

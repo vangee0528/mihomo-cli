@@ -4,7 +4,7 @@
 # 依赖: bash (>=4), curl, jq, column
 # ==============================================================================
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # 默认配置（可通过环境变量或参数覆盖）
 DEFAULT_API="http://127.0.0.1:9090"
@@ -59,11 +59,16 @@ api_req() {
   local path="$2"
   shift 2
   local header_args=()
+  local proxy_args=()
   if [[ -n "$SECRET" ]]; then
     header_args+=(-H "Authorization: Bearer $SECRET")
   fi
+  # 本地控制器不能再次走正在管理的代理，避免代理环境变量造成回环。
+  if [[ "$API" =~ ^https?://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]]; then
+    proxy_args+=(--noproxy '*')
+  fi
 
-  curl -s -m 8 -X "$method" "${API}${path}" "${header_args[@]}" "$@"
+  curl -sS -m 8 -X "$method" "${API}${path}" "${header_args[@]}" "${proxy_args[@]}" "$@"
 }
 
 check_api() {
@@ -125,22 +130,96 @@ close_all_connections() {
   api_req DELETE "/connections" >/dev/null
 }
 
+delay_request() {
+  local path="$1"
+  local kind="$2"
+  local response body http_code error_message request_timeout curl_code
+
+  # 加上控制器响应余量；--timeout 大于 8 秒时不能被固定的 curl 超时截断。
+  request_timeout=$(( (TIMEOUT_MS + 999) / 1000 + 3 ))
+  if response=$(api_req GET "$path" --connect-timeout 3 -m "$request_timeout" -w $'\n%{http_code}' 2>&1); then
+    :
+  else
+    curl_code=$?
+    response="${response//$'\n'/ }"
+    response="${response//$'\r'/ }"
+    printf '测速请求失败 (curl %s): %.240s\n' "$curl_code" "$response" >&2
+    return 1
+  fi
+
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    error_message=$(printf '%s' "$body" | jq -r '
+      if type == "object" then (.message // .error // empty) | select(type == "string")
+      else empty end
+    ' 2>/dev/null || true)
+    error_message="${error_message//$'\n'/ }"
+    error_message="${error_message//$'\r'/ }"
+    printf '测速请求失败 (HTTP %s): %.240s\n' "$http_code" "${error_message:-控制器未返回可用的错误详情}" >&2
+    return 1
+  fi
+
+  if [[ "$kind" == "group" ]]; then
+    if ! printf '%s' "$body" | jq -e '
+      type == "object" and all(.[]; type == "number" and . >= 0 and floor == .)
+    ' >/dev/null 2>&1; then
+      printf '测速请求失败: 批量延迟响应不是有效的节点延迟映射\n' >&2
+      return 1
+    fi
+  else
+    if ! printf '%s' "$body" | jq -e '
+      type == "object" and (.delay | type == "number" and . >= 0 and floor == .)
+    ' >/dev/null 2>&1; then
+      printf '测速请求失败: 单节点响应没有有效的 delay 值\n' >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$body"
+}
+
+validate_test_settings() {
+  if [[ ! "$TIMEOUT_MS" =~ ^[1-9][0-9]{0,8}$ ]]; then
+    printf '测速超时必须是正整数毫秒\n' >&2
+    return 1
+  fi
+  if [[ ! "$TEST_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+    printf '测速地址必须是 HTTP 或 HTTPS URL\n' >&2
+    return 1
+  fi
+}
+
+delay_for_node() {
+  local delay_map="$1"
+  local node="$2"
+  # 必须保持输入为延迟映射，不能用 "$node | in(.)" 将上下文变为字符串。
+  printf '%s' "$delay_map" | jq -er --arg n "$node" '
+    if type != "object" then error("invalid delay map")
+    else .[$n] as $delay |
+      if ($delay | type) == "number" and $delay > 0 then $delay else 999999 end
+    end
+  '
+}
+
 test_group_delay() {
   local group="$1"
+  validate_test_settings || return 1
   local enc_grp
   enc_grp=$(url_encode "$group")
   local enc_url
   enc_url=$(url_encode "$TEST_URL")
-  api_req GET "/group/${enc_grp}/delay?url=${enc_url}&timeout=${TIMEOUT_MS}"
+  delay_request "/group/${enc_grp}/delay?url=${enc_url}&timeout=${TIMEOUT_MS}" group
 }
 
 test_single_delay() {
   local node="$1"
+  validate_test_settings || return 1
   local enc_node
   enc_node=$(url_encode "$node")
   local enc_url
   enc_url=$(url_encode "$TEST_URL")
-  api_req GET "/proxies/${enc_node}/delay?url=${enc_url}&timeout=${TIMEOUT_MS}"
+  delay_request "/proxies/${enc_node}/delay?url=${enc_url}&timeout=${TIMEOUT_MS}" single
 }
 
 # 获取所有可用策略组列表
@@ -313,7 +392,9 @@ cmd_test() {
 
   echo -e "${CYAN}⚡ 正在并行扫描并测速策略组 [${BLUE}$group${CYAN}] 中的所有节点 (超时: ${TIMEOUT_MS}ms)...${RESET}"
   local delay_res
-  delay_res=$(test_group_delay "$group")
+  if ! delay_res=$(test_group_delay "$group"); then
+    return 1
+  fi
 
   echo -e "\n${BOLD}测速结果 (按延迟升序排序):${RESET}\n"
 
@@ -325,7 +406,7 @@ cmd_test() {
       name: .,
       is_now: (. == $p[$g].now),
       type: ($p[.].type // "-"),
-      delay: ($delays[.] // 999999)
+      delay: (if ($delays[.] // 0) > 0 then $delays[.] else 999999 end)
     }) |
     sort_by(.delay) |
     .[] |
@@ -458,9 +539,6 @@ cleanup_tui() {
   fi
 }
 
-# 捕获退出信号
-trap cleanup_tui INT TERM EXIT
-
 read_key() {
   local key=""
   local rest=""
@@ -499,6 +577,7 @@ tui_main() {
   fi
 
   # 初始化终端
+  trap cleanup_tui INT TERM EXIT
   stty -echo -icanon min 1 time 0 2>/dev/null || true
   tput smcup 2>/dev/null || true
   tput civis 2>/dev/null || true
@@ -754,7 +833,10 @@ tui_main() {
   while true; do
     draw_ui
     local key
-    key=$(read_key)
+    if ! key=$(read_key); then
+      # 终端关闭或输入 EOF 时退出，不能误当成 Enter 切换节点并断开连接。
+      break
+    fi
 
     case "$key" in
       # 方向键上 / k
@@ -819,14 +901,18 @@ tui_main() {
         draw_ui
 
         local delay_map
-        delay_map=$(test_group_delay "$active_group")
+        if ! delay_map=$(test_group_delay "$active_group" 2>&1); then
+          status_msg="✖ 批量测速失败: ${delay_map//$'\n'/ }"
+          status_msg_color="$RED"
+          continue
+        fi
 
         # 更新 raw_nodes 中的延迟
         local updated_nodes=()
         for item in "${raw_nodes[@]}"; do
           IFS=$'\t' read -r name type delay is_act <<< "$item"
           local new_delay
-          new_delay=$(echo "$delay_map" | jq -r --arg n "$name" '($n | in(.)) as $has | if $has then .[$n] else 999999 end' 2>/dev/null || echo "999999")
+          new_delay=$(delay_for_node "$delay_map" "$name")
           updated_nodes+=("${name}"$'\t'"${type}"$'\t'"${new_delay}"$'\t'"${is_act}")
         done
         raw_nodes=("${updated_nodes[@]}")
@@ -848,9 +934,13 @@ tui_main() {
           draw_ui
 
           local single_res
-          single_res=$(test_single_delay "$curr_name")
+          if ! single_res=$(test_single_delay "$curr_name" 2>&1); then
+            status_msg="✖ 节点 [${curr_name}] 测速失败: ${single_res//$'\n'/ }"
+            status_msg_color="$RED"
+            continue
+          fi
           local new_delay
-          new_delay=$(echo "$single_res" | jq -r '.delay // 999999' 2>/dev/null || echo "999999")
+          new_delay=$(printf '%s' "$single_res" | jq -r 'if .delay > 0 then .delay else 999999 end')
 
           # 更新节点数据
           local updated_nodes=()
@@ -1011,9 +1101,15 @@ ${BOLD}环境变量与选项:${RESET}
   -s, --secret <密钥>      Mihomo 控制器 Secret 密钥 (默认空 或 \$MIHOMO_SECRET)
   -g, --group <组名>       目标策略组名称 (默认自动挑选节点最多的策略组 或 \$MIHOMO_GROUP)
   --timeout <毫秒>         测速超时时间 (默认: 2500ms 或 \$MIHOMO_TIMEOUT)
+  --test-url <URL>         测速地址 (默认: ${DEFAULT_TEST_URL} 或 \$MIHOMO_TEST_URL)
 
 EOF
 }
+
+# 可供回归测试加载函数，不启动界面、不安装终端清理 trap。
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 # 解析全局参数
 POSITIONAL_ARGS=()
@@ -1032,7 +1128,19 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --timeout)
+      if [[ $# -lt 2 ]]; then
+        printf '%s\n' '--timeout 缺少毫秒参数' >&2
+        exit 1
+      fi
       TIMEOUT_MS="$2"
+      shift 2
+      ;;
+    --test-url)
+      if [[ $# -lt 2 ]]; then
+        printf '%s\n' '--test-url 缺少 URL 参数' >&2
+        exit 1
+      fi
+      TEST_URL="$2"
       shift 2
       ;;
     -h|--help)
